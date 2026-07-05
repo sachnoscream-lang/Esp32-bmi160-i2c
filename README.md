@@ -262,7 +262,18 @@ printf("===============================\r\n\r\n");
 - Bù nhiệt độ và tái hiệu chuẩn bias thích ứng (Adaptive Recalibration)
 - Cải thiện đáng kể độ ổn định khi tính vận tốc từ tích phân gia tốc
 
+### Các hàm/tính năng mới thêm:
+1. bmi160_read_temperature() - đọc nhiệt độ tích hợp sẵn trong BMI160
+2. madgwick_update() - thuật toán AHRS kết hợp Gyro+Accel qua Quaternion
+3. get_gravity_from_quaternion() - tính trọng lực chính xác ở mọi góc nghiêng
+4. get_euler_from_quaternion() - chuyển Quaternion sang Pitch/Roll/Yaw
+5. adaptive_recalibrate() - tự động cập nhật bias liên tục (EMA)
+6. calc_velocity() - tích phân gia tốc ra vận tốc, có lọc nhiễu + ZUPT
 
+### Thay đổi so với bản 5/7/2026:
+- calc_angle() (dùng Accel thô) → thay bằng get_euler_from_quaternion() (dùng Madgwick Filter)
+- Thêm góc Yaw (trước đây không đo được)
+- Tần số đọc: 500ms → 20ms (50Hz) để phù hợp Madgwick Filter
 
 
 
