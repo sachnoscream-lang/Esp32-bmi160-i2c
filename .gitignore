@@ -1,0 +1,22 @@
+# Thư mục build (sinh ra khi biên dịch, không cần đẩy lên Git)
+build/
+build-*/
+
+# Cấu hình sdkconfig cá nhân (có thể khác nhau giữa các máy)
+sdkconfig.old
+
+# File tạm của hệ điều hành
+.DS_Store
+Thumbs.db
+
+# Cấu hình VSCode cá nhân
+.vscode/*
+!.vscode/settings.json
+!.vscode/c_cpp_properties.json
+
+# File log
+*.log
+
+# Thư mục dependencies được ESP-IDF tự tải về
+managed_components/
+dependencies.lock
