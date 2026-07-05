@@ -1,4 +1,6 @@
 # Esp32-bmi160-i2c
+
+5/7/2026
 ------------------------------------------------------------------------------
 Chân trên BMI160    ||    Nối vào chân trên board 
 VCC                 ||    3V3 (chân số 38, cột bên phải)
@@ -252,7 +254,13 @@ printf("===============================\r\n\r\n");
 ==>Khởi tạo kết nối I2C → kiểm tra đúng cảm biến → bật nguồn accel/gyro → lặp vô hạn: đọc 12 byte thô → quy đổi ra đơn vị thực (g, độ/giây) → tính góc nghiêng → in ra Serial mỗi 0.5 giây.
 
 
-
+=====================================================================================================
+6/7/2026
+## Cập nhật mới nhất
+- Tích hợp Madgwick Filter (Quaternion-based AHRS) để ước lượng hướng chính xác hơn
+- Thêm tính năng đo góc Yaw (trước đây chỉ có Pitch/Roll)
+- Bù nhiệt độ và tái hiệu chuẩn bias thích ứng (Adaptive Recalibration)
+- Cải thiện đáng kể độ ổn định khi tính vận tốc từ tích phân gia tốc
 
 
 
