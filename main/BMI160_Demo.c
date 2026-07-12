@@ -4,10 +4,11 @@
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 /* ================== CẤU HÌNH CHÂN I2C ================== */
-#define I2C_SDA_PIN     GPIO_NUM_21   // Chân P21 trên board
-#define I2C_SCL_PIN     GPIO_NUM_22   // Chân P22 trên board
+#define I2C_SDA_PIN     GPIO_NUM_21
+#define I2C_SCL_PIN     GPIO_NUM_22
 #define I2C_FREQ_HZ     400000
 
 /* ================== ĐỊA CHỈ I2C CỦA BMI160 ================== */
@@ -66,15 +67,15 @@ static bool bmi160_init(void)
         ESP_LOGE(TAG, "Khong tim thay BMI160!");
         return false;
     }
-    bmi160_write_reg(REG_CMD, 0x11); vTaskDelay(pdMS_TO_TICKS(100)); // Bật Accel
-    bmi160_write_reg(REG_CMD, 0x15); vTaskDelay(pdMS_TO_TICKS(100)); // Bật Gyro
-    bmi160_write_reg(REG_ACC_RANGE, 0x03); // ±2g
-    bmi160_write_reg(REG_GYR_RANGE, 0x00); // ±2000 dps
+    bmi160_write_reg(REG_CMD, 0x11); vTaskDelay(pdMS_TO_TICKS(100));
+    bmi160_write_reg(REG_CMD, 0x15); vTaskDelay(pdMS_TO_TICKS(100));
+    bmi160_write_reg(REG_ACC_RANGE, 0x03);
+    bmi160_write_reg(REG_GYR_RANGE, 0x00);
     ESP_LOGI(TAG, "Khoi tao BMI160 thanh cong!");
     return true;
 }
 
-/* ================== ĐỌC VÀ QUY ĐỔI DỮ LIỆU CẢM BIẾN (GIỮ NGUYÊN NHƯ BẢN GỐC) ================== */
+/* ================== ĐỌC VÀ QUY ĐỔI DỮ LIỆU (GIỮ NGUYÊN NHƯ BẢN GỐC) ================== */
 static void bmi160_read_data(float *ax, float *ay, float *az,
                               float *gx, float *gy, float *gz)
 {
@@ -105,37 +106,117 @@ static void calc_angle(float ax, float ay, float az, float *pitch, float *roll)
 }
 
 /* ============================================================================
-   PHÁT HIỆN TĂNG TỐC / GIẢM TỐC / ĐỀU GA (PHẦN MỚI THÊM)
+   BỘ LỌC 1: LOW-PASS FILTER (LPF) - Tách phần tín hiệu "MƯỢT, TẦN SỐ THẤP"
    ============================================================================
-   Đơn giản, KHÔNG cần tích phân, KHÔNG bị trôi (drift) theo thời gian - chỉ
-   nhìn trực tiếp vào độ lớn + dấu của gia tốc theo hướng xe di chuyển tại
-   từng thời điểm, so sánh với ngưỡng để phân loại trạng thái.
+   Dùng để lấy ra xu hướng gia tốc thay đổi TỪ TỪ (đặc trưng của tăng/giảm
+   ga) - loại bỏ các đỉnh nhọn tức thời (sốc, va chạm) ra khỏi tín hiệu này.
 ============================================================================ */
-#define ACCEL_THRESHOLD  0.05f  // Ngưỡng coi là "có gia tốc đáng kể" (đơn vị g)
+#define LPF_ALPHA  0.15f  // Càng nhỏ càng mượt (chỉ giữ thay đổi chậm), càng lớn càng nhạy
+
+static float lpf_forward_accel = 0;
+
+static float apply_lpf(float raw_value)
+{
+    lpf_forward_accel = LPF_ALPHA * raw_value + (1.0f - LPF_ALPHA) * lpf_forward_accel;
+    return lpf_forward_accel;
+}
+
+/* ============================================================================
+   BỘ LỌC 2: PHÁT HIỆN CÚ SỐC (SHOCK DETECTION) - Tín hiệu "NHỌN, TẦN SỐ CAO"
+   ============================================================================
+   Độ lớn gia tốc tổng hợp (magnitude) khi ở trạng thái bình thường luôn xấp
+   xỉ 1g (do trọng lực). Khi có va chạm/sốc đột ngột, magnitude tăng vọt bất
+   thường trong tích tắc - đây là tín hiệu chung ban đầu của CẢ té ngã LẪN
+   sóc ổ gà, cần phân biệt tiếp ở bước sau dựa vào TIME (thời gian kéo dài).
+============================================================================ */
+#define SHOCK_MAGNITUDE_THRESHOLD  1.8f   // Vượt ngưỡng này (g) coi là có cú sốc
+#define FALL_ANGLE_THRESHOLD       60.0f  // Góc nghiêng vượt mức này nghi ngờ té ngã
+#define FALL_CONFIRM_TIME_MS       1500   // Giữ góc lớn > 1.5s mới CHẮC CHẮN là té ngã
+#define BUMP_RECOVER_TIME_MS       500    // Góc trở lại bình thường trong 0.5s -> chỉ là sóc
 
 typedef enum {
-    TRANG_THAI_DEU_GA,
-    TRANG_THAI_TANG_TOC,
-    TRANG_THAI_GIAM_TOC
-} TrangThaiToc;
+    SU_KIEN_BINH_THUONG,
+    SU_KIEN_SOC_O_GA,
+    SU_KIEN_TE_NGA
+} SuKienVaCham;
 
-static TrangThaiToc detect_motion_state(float accel_forward)
+typedef enum {
+    TOC_DO_DEU_GA,
+    TOC_DO_TANG_TOC,
+    TOC_DO_GIAM_TOC
+} TrangThaiTocDo;
+
+static bool dang_theo_doi_soc = false;
+static int64_t thoi_diem_bat_dau_soc = 0;
+
+// Phân loại sự kiện va chạm: BINH_THUONG / SOC_O_GA / TE_NGA
+static SuKienVaCham detect_impact_event(float ax, float ay, float az, float roll, float pitch)
 {
-    if (accel_forward > ACCEL_THRESHOLD) {
-        return TRANG_THAI_TANG_TOC;
-    } else if (accel_forward < -ACCEL_THRESHOLD) {
-        return TRANG_THAI_GIAM_TOC;
+    float magnitude = sqrtf(ax * ax + ay * ay + az * az);
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    bool goc_nghieng_lon = (fabsf(roll) > FALL_ANGLE_THRESHOLD) || (fabsf(pitch) > FALL_ANGLE_THRESHOLD);
+
+    if (!dang_theo_doi_soc) {
+        // Chưa có sốc nào đang theo dõi - kiểm tra xem có cú sốc mới xảy ra không
+        if (magnitude > SHOCK_MAGNITUDE_THRESHOLD) {
+            dang_theo_doi_soc = true;
+            thoi_diem_bat_dau_soc = now_ms;
+            ESP_LOGW(TAG, ">>> Phat hien cu soc (magnitude=%.2fg) - dang theo doi...", magnitude);
+        }
+        return SU_KIEN_BINH_THUONG;
     } else {
-        return TRANG_THAI_DEU_GA;
+        // Đang theo dõi 1 cú sốc - xem diễn biến TIẾP THEO để phân loại
+        int64_t elapsed = now_ms - thoi_diem_bat_dau_soc;
+
+        if (goc_nghieng_lon && elapsed > FALL_CONFIRM_TIME_MS) {
+            // Góc nghiêng lớn VÀ giữ nguyên đủ lâu -> CHẮC CHẮN té ngã
+            ESP_LOGE(TAG, "!!! XAC NHAN TE NGA !!! Roll=%.1f Pitch=%.1f", roll, pitch);
+            dang_theo_doi_soc = false; // Reset để theo dõi sự kiện tiếp theo
+            return SU_KIEN_TE_NGA;
+        }
+
+        if (!goc_nghieng_lon && elapsed > BUMP_RECOVER_TIME_MS) {
+            // Góc đã trở lại bình thường trong thời gian ngắn -> chỉ là sóc ổ gà
+            ESP_LOGI(TAG, ">>> Xac nhan CHI LA SOC O GA (da tro lai binh thuong)");
+            dang_theo_doi_soc = false;
+            return SU_KIEN_SOC_O_GA;
+        }
+
+        // Vẫn đang trong giai đoạn theo dõi, chưa đủ dữ kiện kết luận
+        return SU_KIEN_BINH_THUONG;
     }
 }
 
-static const char* trang_thai_to_string(TrangThaiToc state)
+// Phân loại trạng thái tốc độ: DEU_GA / TANG_TOC / GIAM_TOC
+// Dùng tín hiệu ĐÃ QUA LPF (mượt) để loại bỏ ảnh hưởng của sốc/rung xóc ngắn
+#define ACCEL_THRESHOLD  0.05f
+
+static TrangThaiTocDo detect_motion_state(float accel_forward_filtered)
 {
-    switch (state) {
-        case TRANG_THAI_TANG_TOC: return "TANG TOC";
-        case TRANG_THAI_GIAM_TOC: return "GIAM TOC (PHANH)";
-        default:                  return "DEU GA";
+    if (accel_forward_filtered > ACCEL_THRESHOLD) {
+        return TOC_DO_TANG_TOC;
+    } else if (accel_forward_filtered < -ACCEL_THRESHOLD) {
+        return TOC_DO_GIAM_TOC;
+    } else {
+        return TOC_DO_DEU_GA;
+    }
+}
+
+static const char* impact_to_string(SuKienVaCham e)
+{
+    switch (e) {
+        case SU_KIEN_TE_NGA:   return "TE NGA";
+        case SU_KIEN_SOC_O_GA: return "SOC O GA";
+        default:                return "Binh thuong";
+    }
+}
+
+static const char* speed_to_string(TrangThaiTocDo s)
+{
+    switch (s) {
+        case TOC_DO_TANG_TOC: return "TANG TOC";
+        case TOC_DO_GIAM_TOC: return "GIAM TOC";
+        default:               return "DEU GA";
     }
 }
 
@@ -153,29 +234,28 @@ void app_main(void)
 
     float ax, ay, az, gx, gy, gz, pitch, roll;
 
-    // LƯU Ý QUAN TRỌNG: Chọn đúng trục theo hướng xe di chuyển tới/lui.
-    // Tùy cách gắn cảm biến lên xe máy, hướng "tiến/lùi" có thể là X, Y hoặc Z.
-    // Mặc định đang dùng trục X - đổi lại thành ax/ay/az cho đúng thực tế lắp đặt.
+    // LƯU Ý: Chọn đúng trục theo hướng xe di chuyển tới/lui (tùy cách gắn cảm biến)
+    // Mặc định dùng trục X - đổi thành ay/az nếu thực tế lắp đặt khác.
 
     while (1) {
         bmi160_read_data(&ax, &ay, &az, &gx, &gy, &gz);
         calc_angle(ax, ay, az, &pitch, &roll);
 
-        // Gia tốc theo hướng di chuyển - trừ sẵn phần dư nhỏ do lệch cảm biến
-        // (KHÔNG cần trừ trọng lực phức tạp vì trục "tiến/lùi" của xe thường
-        // nằm ngang, ít bị ảnh hưởng bởi trọng lực như trục thẳng đứng Z)
-        float accel_forward = ax; // ĐỔI THÀNH ay HOẶC az NẾU TRỤC THỰC TẾ KHÁC
-        TrangThaiToc trang_thai = detect_motion_state(accel_forward);
+        float accel_forward = ax; // ĐỔI TRỤC NẾU CẦN
+        float accel_forward_filtered = apply_lpf(accel_forward); // Qua LPF - mượt hóa
 
-        // GIỮ NGUYÊN FORMAT LOG GỐC + THÊM DÒNG TRẠNG THÁI
+        SuKienVaCham su_kien = detect_impact_event(ax, ay, az, roll, pitch);
+        TrangThaiTocDo trang_thai_toc = detect_motion_state(accel_forward_filtered);
+
+        // GIỮ NGUYÊN FORMAT LOG GỐC + THÊM 2 DÒNG PHÂN LOẠI MỚI
         printf("===== BMI160 SENSOR DATA =====\r\n");
-        printf("Accel (g)   : X=%.3f  Y=%.3f  Z=%.3f\r\n", ax, ay, az);
-        printf("Gyro (dps)  : X=%.3f  Y=%.3f  Z=%.3f\r\n", gx, gy, gz);
-        printf("Goc nghieng : Pitch=%.2f  Roll=%.2f\r\n", pitch, roll);
-        printf("Trang thai  : %s (accel_forward=%.3fg)\r\n",
-               trang_thai_to_string(trang_thai), accel_forward);
+        printf("Accel (g)     : X=%.3f  Y=%.3f  Z=%.3f\r\n", ax, ay, az);
+        printf("Gyro (dps)    : X=%.3f  Y=%.3f  Z=%.3f\r\n", gx, gy, gz);
+        printf("Goc nghieng   : Pitch=%.2f  Roll=%.2f\r\n", pitch, roll);
+        printf("Trang thai toc: %s (loc LPF=%.3fg)\r\n", speed_to_string(trang_thai_toc), accel_forward_filtered);
+        printf("Su kien va cham: %s\r\n", impact_to_string(su_kien));
         printf("===============================\r\n\r\n");
 
-        vTaskDelay(pdMS_TO_TICKS(200)); // Đọc mỗi 0.2 giây - đủ nhanh để bắt kịp thay đổi
+        vTaskDelay(pdMS_TO_TICKS(50)); // Đọc nhanh (50ms=20Hz) để bắt kịp cú sốc tức thời
     }
 }
