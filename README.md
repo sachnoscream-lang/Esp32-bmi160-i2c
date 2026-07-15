@@ -274,8 +274,512 @@ printf("===============================\r\n\r\n");
 - calc_angle() (dùng Accel thô) → thay bằng get_euler_from_quaternion() (dùng Madgwick Filter)
 - Thêm góc Yaw (trước đây không đo được)
 - Tần số đọc: 500ms → 20ms (50Hz) để phù hợp Madgwick Filter
+------------------------------------------------------------
+cập nhật code mới của a quy và BMI 
 
+1. Phần đầu file
+Dòng 1-5: Comment tiêu đề. Chỉ để ghi tên project và mô tả ngắn.
 
+Dòng 7 #include <Arduino.h>: lấy thư viện Arduino để dùng setup(), loop(), Serial, millis(), analogRead()...
+
+Dòng 8 #include <stdio.h>: dùng printf, snprintf.
+
+Dòng 9 #include <math.h>: dùng sqrtf, atan2f, fabsf.
+
+Dòng 10 #include "config.h": lấy các hằng số cấu hình như POT_PIN, RPM_IDLE, ADC_MAX_RAW...
+
+Dòng 11 #include "sound_registry.h": danh sách âm thanh động cơ.
+
+Dòng 12 #include "audio_engine.h": phần xử lý âm thanh.
+
+Dòng 13 #include "ble_manager.h": phần BLE.
+
+Dòng 15-17: comment + include driver I2C và timer của ESP32.
+
+Dòng 16 #include "driver/i2c.h": dùng I2C kiểu ESP-IDF cũ.
+
+Dòng 17 #include "esp_timer.h": dùng timer microsecond để đo thời gian chính xác.
+
+2. Cấu hình chân I2C và thanh ghi BMI160
+Dòng 19: comment, báo đây là phần cấu hình I2C.
+
+Dòng 20 #define I2C_SDA_PIN GPIO_NUM_21: chân SDA là GPIO 21.
+
+Dòng 21 #define I2C_SCL_PIN GPIO_NUM_22: chân SCL là GPIO 22.
+
+Dòng 22 #define I2C_FREQ_HZ 400000: tốc độ I2C là 400kHz.
+
+Dòng 23 #define BMI160_ADDR 0x69: địa chỉ I2C của BMI160.
+
+Dòng 24 #define I2C_PORT_NUM I2C_NUM_0: dùng bus I2C số 0.
+
+Dòng 26: comment nói về các thanh ghi của BMI160.
+
+Dòng 27 REG_CHIP_ID: thanh ghi ID chip.
+
+Dòng 28 REG_GYR_DATA: thanh ghi dữ liệu gyro.
+
+Dòng 29 REG_ACC_RANGE: thanh ghi chọn dải đo accel.
+
+Dòng 30 REG_GYR_RANGE: thanh ghi chọn dải đo gyro.
+
+Dòng 31 REG_CMD: thanh ghi lệnh điều khiển BMI160.
+
+Dòng 33 LPF_ALPHA 0.15f: hệ số lọc thông thấp.
+
+Dòng 34 ACCEL_THRESHOLD 0.05f: ngưỡng phát hiện tăng tốc nhẹ.
+
+Dòng 35 SHOCK_MAGNITUDE_THRESHOLD 1.8f: ngưỡng sốc mạnh.
+
+Dòng 36 FALL_ANGLE_THRESHOLD 60.0f: góc nghiêng để coi là ngã.
+
+Dòng 37 FALL_CONFIRM_TIME_MS 1500: cần nghiêng lâu 1.5s mới xác nhận ngã.
+
+Dòng 38 BUMP_RECOVER_TIME_MS 500: sốc ngắn thì coi là va chạm thường.
+
+3. Enum trạng thái
+Dòng 40: comment báo phần enum trạng thái.
+
+Dòng 41-45 EngineState: trạng thái động cơ.
+
+ENG_OFF: tắt.
+ENG_STARTING: đang đề máy.
+ENG_RUNNING: đang chạy.
+Dòng 47-51 SuKienVaCham: kiểu dữ liệu cho sự kiện va chạm.
+
+SU_KIEN_BINH_THUONG: bình thường.
+SU_KIEN_SOC_O_GA: sốc/va chạm ở ga.
+SU_KIEN_TE_NGA: té ngã.
+Dòng 53-57 TrangThaiTocDo: trạng thái tốc độ.
+
+TOC_DO_DEU_GA: đều ga.
+TOC_DO_TANG_TOC: tăng tốc.
+TOC_DO_GIAM_TOC: giảm tốc/phanh.
+4. Biến toàn cục
+Dòng 59: comment cho biến toàn cục.
+
+Dòng 60 s_currentRPM: RPM hiện tại.
+
+Dòng 61 s_targetRPM: RPM mục tiêu.
+
+Dòng 62 s_state: trạng thái động cơ hiện tại.
+
+Dòng 64 lpf_forward_accel: giá trị gia tốc đã lọc.
+
+Dòng 65 dang_theo_doi_soc: có đang theo dõi một cú sốc không.
+
+Dòng 66 thoi_diem_bat_dau_soc: thời điểm bắt đầu sốc.
+
+Dòng 68 throttle_bmi: ga lấy từ BMI160.
+
+Dòng 70: comment giải thích fix cho té ngã.
+
+Dòng 71 dang_bi_te_nga: cờ báo xe đang trong trạng thái ngã.
+
+Dòng 72 thoi_diem_te_nga: thời điểm phát hiện ngã.
+
+Dòng 73 FALL_SAFE_HOLD_MS 1000: giữ trạng thái ngã an toàn 1 giây.
+
+Dòng 75: comment cho biến log.
+
+Dòng 76 g_ax, g_ay, g_az: accel X/Y/Z.
+
+Dòng 77 g_gx, g_gy, g_gz: gyro X/Y/Z.
+
+Dòng 78 g_pitch, g_roll: góc nghiêng pitch/roll.
+
+Dòng 79 g_su_kien: sự kiện va chạm hiện tại.
+
+Dòng 80 g_trang_thai_toc: trạng thái tốc độ hiện tại.
+
+5. Hàm tắt máy
+Dòng 82-84 requestEngineOff(): hàm này chỉ làm một việc: ép trạng thái động cơ về ENG_OFF.
+6. Hàm đổi enum sang chữ
+Dòng 86: comment nói đây là hàm đổi mã thành chữ.
+
+Dòng 87 impact_to_string(SuKienVaCham e): nhận một sự kiện va chạm, trả về chuỗi để in log.
+
+Dòng 88 switch (e): rẽ nhánh theo giá trị enum.
+
+Dòng 89: nếu là té ngã thì trả "TE NGA".
+
+Dòng 90: nếu là sốc ở ga thì trả "SOC O GA".
+
+Dòng 91: mặc định trả "Binh thuong".
+
+Dòng 92-93: kết thúc switch/hàm.
+
+Dòng 95 speed_to_string(TrangThaiTocDo s): đổi trạng thái tốc độ thành chữ.
+
+Dòng 96 switch (s): rẽ nhánh theo tốc độ.
+
+Dòng 97: tăng tốc -> "TANG TOC".
+
+Dòng 98: giảm tốc -> "GIAM TOC".
+
+Dòng 99: còn lại -> "DEU GA".
+
+Dòng 100-101: kết thúc.
+
+7. Hàm I2C ghi thanh ghi
+Dòng 103: comment nói phần I2C driver cũ.
+Dòng 104 bmi160_write_reg(...): ghi 1 byte vào thanh ghi BMI160.
+Dòng 105 tạo chuỗi I2C command.
+Dòng 106 bắt đầu giao dịch I2C.
+Dòng 107 gửi địa chỉ chip + bit ghi.
+Dòng 108 gửi địa chỉ thanh ghi.
+Dòng 109 gửi dữ liệu cần ghi.
+Dòng 110 kết thúc giao dịch.
+Dòng 111 comment: timeout chỉ 50ms.
+Dòng 112 thực thi lệnh I2C.
+Dòng 113 xóa command link.
+Dòng 114-115 trả kết quả.
+8. Hàm I2C đọc thanh ghi
+Dòng 117 bmi160_read_regs(...): đọc nhiều byte từ BMI160.
+Dòng 118 nếu len == 0 thì trả OK ngay.
+Dòng 119 tạo command I2C.
+Dòng 120 start.
+Dòng 121 gửi địa chỉ chip với chế độ ghi.
+Dòng 122 gửi địa chỉ thanh ghi cần đọc.
+Dòng 124 start lại để chuyển sang chế độ đọc.
+Dòng 125 gửi địa chỉ chip với bit đọc.
+Dòng 126-128 nếu cần đọc hơn 1 byte thì đọc phần đầu trước.
+Dòng 129 đọc byte cuối cùng và NACK.
+Dòng 130 stop.
+Dòng 131 comment timeout 50ms.
+Dòng 132 chạy command.
+Dòng 133 xóa command.
+Dòng 134-135 trả kết quả.
+9. Hàm setup I2C
+Dòng 137 i2c_master_setup_legacy(): cấu hình bus I2C.
+Dòng 138 khai báo biến cấu hình conf.
+Dòng 139 đặt chế độ master.
+Dòng 140 set chân SDA.
+Dòng 141 bật pull-up SDA.
+Dòng 142 set chân SCL.
+Dòng 143 bật pull-up SCL.
+Dòng 144 set tốc độ xung I2C.
+Dòng 145 set cờ clock.
+Dòng 147 áp cấu hình I2C.
+Dòng 148 cài driver I2C.
+Dòng 149 kết thúc.
+10. Hàm init BMI160
+Dòng 151 bmi160_init_legacy(): khởi tạo cảm biến.
+Dòng 152 biến lưu chip ID.
+Dòng 153 đọc thanh ghi CHIP_ID.
+Dòng 154 kiểm tra chip có đúng 0xD1 không.
+Dòng 155 nếu sai thì in lỗi.
+Dòng 156 trả false nếu sai.
+Dòng 158 gửi lệnh bật accel, rồi delay.
+Dòng 159 gửi lệnh bật gyro, rồi delay.
+Dòng 160 đặt dải đo accel.
+Dòng 161 đặt dải đo gyro.
+Dòng 162 báo init thành công.
+Dòng 163 trả true.
+Dòng 164 kết thúc.
+11. Hàm đọc dữ liệu BMI160
+Dòng 166 comment nói thuật toán chia tỉ lệ.
+Dòng 167 hàm đọc data thô từ BMI160.
+Dòng 168 mảng raw 12 byte.
+Dòng 169 đọc 12 byte từ thanh ghi gyro data.
+Dòng 171-176 ghép 2 byte thành int16_t cho gyro và accel.
+Dòng 178-180 đổi raw accel sang đơn vị g.
+Dòng 181-183 đổi raw gyro sang dps.
+Dòng 184 kết thúc.
+12. Hàm lọc thông thấp
+Dòng 186 apply_lpf(...): lọc nhiễu.
+Dòng 187 công thức LPF: giá trị mới = phần mới * alpha + phần cũ * (1-alpha).
+Dòng 188 trả giá trị đã lọc.
+Dòng 189 kết thúc.
+13. Phát hiện va chạm / té ngã
+Dòng 191 detect_impact_event(...): phát hiện sự kiện va chạm.
+
+Dòng 192 tính độ lớn vector gia tốc.
+
+Dòng 193 lấy thời gian hiện tại (ms).
+
+Dòng 194 kiểm tra góc nghiêng có lớn hơn ngưỡng không.
+
+Dòng 196 nếu chưa theo dõi sốc:
+
+Dòng 197 nếu magnitude vượt ngưỡng sốc:
+
+Dòng 198 bật cờ theo dõi sốc.
+
+Dòng 199 lưu thời điểm bắt đầu sốc.
+
+Dòng 200 kết thúc if.
+
+Dòng 201 trả bình thường ở chu kỳ đầu.
+
+Dòng 202 nếu đang theo dõi sốc:
+
+Dòng 203 tính thời gian đã trôi qua.
+
+Dòng 204 nếu nghiêng lớn và đủ lâu:
+
+Dòng 205 tắt theo dõi sốc.
+
+Dòng 206 trả về té ngã.
+
+Dòng 208 nếu không nghiêng lớn và sốc chỉ là va chạm ngắn:
+
+Dòng 209 tắt theo dõi sốc.
+
+Dòng 210 trả va chạm ở ga.
+
+Dòng 212 nếu chưa đủ điều kiện thì vẫn bình thường.
+
+Dòng 213-214 kết thúc hàm.
+
+14. Nhận diện tăng/giảm tốc
+Dòng 216 detect_motion_state(...): xác định xe đang tăng hay giảm tốc.
+Dòng 217 nếu accel dương lớn hơn ngưỡng:
+Dòng 218 trả TOC_DO_TANG_TOC.
+Dòng 219 nếu accel âm nhỏ hơn âm ngưỡng:
+Dòng 220 trả TOC_DO_GIAM_TOC.
+Dòng 221 còn lại:
+Dòng 222 trả TOC_DO_DEU_GA.
+Dòng 223-224 kết thúc.
+15. Đọc biến trở tay ga
+Dòng 226 comment.
+
+Dòng 227 readPotSmooth(): đọc analog biến trở.
+
+Dòng 228 biến sum.
+
+Dòng 229 lặp 8 lần để lấy mẫu mượt hơn.
+
+Dòng 230 đọc ADC từ POT_PIN.
+
+Dòng 231 delay rất ngắn giữa các lần đọc.
+
+Dòng 233 lấy trung bình bằng dịch bit phải 3.
+
+Dòng 234 trừ phần nhiễu thấp.
+
+Dòng 235 nếu âm thì chặn về 0.
+
+Dòng 236 tính giá trị dùng được tối đa.
+
+Dòng 237 chặn không vượt quá max.
+
+Dòng 238 trả kết quả.
+
+Dòng 239 kết thúc.
+
+Dòng 241 adcToThrottle(...): đổi ADC thành phần trăm ga.
+
+Dòng 242 tính vùng ADC hữu dụng.
+
+Dòng 243 nếu dưới deadband thì coi như 0 ga.
+
+Dòng 244 chuẩn hóa sang 0..1.
+
+Dòng 245 nếu quá 1 thì chặn lại.
+
+Dòng 246 trả t.
+
+Dòng 247 kết thúc.
+
+16. Hàm setup
+Dòng 249 comment.
+
+Dòng 250 setup(): chạy 1 lần khi ESP32 khởi động.
+
+Dòng 251 mở Serial 115200.
+
+Dòng 252 delay để Serial ổn định.
+
+Dòng 254 in dòng tiêu đề.
+
+Dòng 255 in tên project.
+
+Dòng 256 in số profile âm thanh.
+
+Dòng 257 in dải RPM.
+
+Dòng 258 in dấu ngăn cách.
+
+Dòng 260 setup I2C.
+
+Dòng 261 nếu BMI160 init fail:
+
+Dòng 262 in lỗi nghiêm trọng.
+
+Dòng 263 kết thúc if.
+
+Dòng 265 init audio engine.
+
+Dòng 267 báo đang init BLE.
+
+Dòng 268 khởi tạo BLE với tên thiết bị.
+
+Dòng 269 báo hệ thống sẵn sàng.
+
+Dòng 270 kết thúc setup.
+
+17. Hàm loop
+Dòng 272 comment.
+Dòng 273 loop(): chạy lặp mãi.
+Dòng 274 biến lưu thời điểm log gần nhất.
+Dòng 275 biến lưu thời điểm đọc BMI gần nhất.
+Dòng 277 gọi AudioEngine_fillBuffer() để nạp buffer âm thanh.
+18. Đọc BMI160 mỗi 20ms
+Dòng 279 comment.
+
+Dòng 280 nếu đã qua 20ms thì đọc tiếp.
+
+Dòng 281 cập nhật mốc thời gian.
+
+Dòng 282 đọc dữ liệu cảm biến vào các biến global.
+
+Dòng 284 tính pitch.
+
+Dòng 285 tính roll.
+
+Dòng 287 lọc gia tốc forward.
+
+Dòng 289 comment sửa lỗi dùng fabsf().
+
+Dòng 290 chỉ nếu accel dương đủ lớn mới tính throttle BMI.
+
+Dòng 291 chuẩn hóa ga BMI.
+
+Dòng 292 chặn tối đa 1.0.
+
+Dòng 293-294 nếu không đủ ngưỡng thì ga BMI = 0.
+
+Dòng 295 kết thúc else.
+
+Dòng 297 phát hiện sự kiện va chạm.
+
+Dòng 298 phát hiện trạng thái tốc độ.
+
+Dòng 300 comment fix té ngã.
+
+Dòng 301 nếu phát hiện té ngã:
+
+Dòng 302 bật cờ ngã.
+
+Dòng 303 lưu thời điểm ngã.
+
+Dòng 304 tắt động cơ.
+
+Dòng 305 kết thúc if.
+
+Dòng 307 comment kiểm tra hết thời gian an toàn chưa.
+
+Dòng 308 nếu hết 1 giây:
+
+Dòng 309 tắt cờ ngã.
+
+Dòng 310 kết thúc if.
+
+Dòng 311 kết thúc khối đọc BMI.
+
+19. Xử lý lệnh Serial
+Dòng 313 comment.
+Dòng 314 nếu có dữ liệu trên Serial:
+Dòng 315 đọc 1 dòng đến \n.
+Dòng 316 xóa khoảng trắng.
+Dòng 317 nếu chuỗi bắt đầu bằng S hoặc s:
+Dòng 318 lấy số sau chữ S rồi đổi thành index.
+Dòng 319 nếu index hợp lệ:
+Dòng 320 chuyển âm thanh.
+Dòng 321 tắt động cơ để áp sound mới.
+Dòng 322-323 kết thúc if.
+Dòng 324 kết thúc xử lý Serial.
+20. Xử lý BLE
+Dòng 326 comment.
+Dòng 327 gọi BLEManager_process() để BLE hoạt động.
+21. Trộn ga
+Dòng 329 comment.
+Dòng 330 đọc biến trở.
+Dòng 331 đổi ADC sang throttle của biến trở.
+Dòng 332 cộng ga biến trở + ga BMI.
+Dòng 333 chặn tổng ga tối đa là 1.0.
+22. State machine động cơ
+Dòng 335 comment.
+Dòng 336 switch (s_state): xử lý theo trạng thái động cơ.
+Case ENG_OFF
+Dòng 337 vào trạng thái tắt.
+Dòng 338 tắt âm thanh.
+Dòng 339 comment fix trạng thái ngã.
+Dòng 340 nếu có ga và không đang ngã:
+Dòng 341 reset RPM về 0.
+Dòng 342 phát âm thanh đề máy.
+Dòng 343 chuyển sang ENG_STARTING.
+Dòng 344-345 kết thúc case.
+Case ENG_STARTING
+Dòng 347 đang đề máy.
+Dòng 348 nếu tiếng đề đã xong:
+Dòng 349 set RPM về idle.
+Dòng 350 set target RPM về idle.
+Dòng 351 cập nhật âm thanh ở idle.
+Dòng 352 chuyển sang chạy bình thường.
+Dòng 353-354 kết thúc case.
+Case ENG_RUNNING
+Dòng 356 đang chạy.
+Dòng 357 tính RPM mục tiêu theo tổng ga.
+Dòng 359 nếu RPM hiện tại nhỏ hơn mục tiêu:
+Dòng 360 tính mức tăng RPM.
+Dòng 361 cộng RPM.
+Dòng 362 nếu vượt mục tiêu thì chặn lại.
+Dòng 363 ngược lại nếu RPM đang cao hơn mục tiêu:
+Dòng 364 giảm RPM.
+Dòng 365 nếu thấp hơn mục tiêu thì chặn lại.
+Dòng 366 kết thúc else.
+Dòng 368 cập nhật engine sound theo RPM hiện tại.
+Dòng 369-370 kết thúc case/switch.
+23. In log mỗi 300ms
+Dòng 372 comment.
+
+Dòng 373 nếu đã 300ms thì in log.
+
+Dòng 374 cập nhật thời điểm log.
+
+Dòng 375-376 tạo chuỗi st là OFF/STARTING/RUNNING.
+
+Dòng 378 comment.
+
+Dòng 379 in tiêu đề khối BMI160.
+
+Dòng 380 in accel X/Y/Z.
+
+Dòng 381 in gyro X/Y/Z.
+
+Dòng 382 in pitch/roll.
+
+Dòng 383 in trạng thái tốc độ và giá trị LPF.
+
+Dòng 384 in sự kiện va chạm.
+
+Dòng 385 in dòng ngăn cách.
+
+Dòng 387 comment.
+
+Dòng 388 khai báo buffer log.
+
+Dòng 389-392 format chuỗi log đầy đủ:
+
+trạng thái động cơ
+RPM
+tổng ga
+ga POT
+ga IMU
+volume
+rev mix
+số lần ISR
+Dòng 394 in log ra Serial.
+
+Dòng 395 gửi log qua BLE.
+
+Dòng 396 kết thúc khối log.
+
+24. Cuối loop
+Dòng 398 delay 2ms để loop không chạy quá gắt.
+Dòng 399 đóng hàm loop().
 
 
 
